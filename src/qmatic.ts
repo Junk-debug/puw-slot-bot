@@ -1,31 +1,33 @@
 import { config } from "./config.js";
 import { getState } from "./state.js";
 
-export interface TimeSlot {
+const REQUEST_TIMEOUT_MS = 15_000;
+
+export interface AvailableDay {
   date: string; // YYYY-MM-DD
   times: string[]; // ["08:00", "08:40", ...]
 }
 
-const commonHeaders = {
+export const BOOKING_URL = `${config.base}/#/`;
+
+const HEADERS = {
   accept: "application/json, text/plain, */*",
   "accept-language": "en-US,en;q=0.9",
   referer: `${config.base}/`,
 };
 
-// Qmatic uses matrix params (;key=value) on the path segment.
-// branch/service are read from runtime state so /setbranch & /setservice take effect live.
-function datesUrl(): string {
+// Qmatic passes options as matrix params (;key=value) on the last path segment.
+// Branch/service come from runtime state so /setbranch and /setservice apply without a restart.
+function scheduleUrl(path: string): string {
   const { branchId, serviceId } = getState();
-  return `${config.base}/rest/schedule/branches/${branchId}/dates;servicePublicId=${serviceId};customSlotLength=${config.customSlotLength}`;
-}
-
-function timesUrl(date: string): string {
-  const { branchId, serviceId } = getState();
-  return `${config.base}/rest/schedule/branches/${branchId}/dates/${date}/times;servicePublicId=${serviceId};customSlotLength=${config.customSlotLength}`;
+  return (
+    `${config.base}/rest/schedule/branches/${branchId}/${path}` +
+    `;servicePublicId=${serviceId};customSlotLength=${config.customSlotLength}`
+  );
 }
 
 async function getJson(url: string): Promise<unknown> {
-  const res = await fetch(url, { headers: commonHeaders });
+  const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
   if (!res.ok) {
     throw new Error(`HTTP ${res.status} for ${url}`);
   }
@@ -33,66 +35,49 @@ async function getJson(url: string): Promise<unknown> {
   try {
     return JSON.parse(text);
   } catch {
-    throw new Error(`Non-JSON response (path/session may have changed): ${text.slice(0, 120)}`);
+    throw new Error(`Non-JSON response (path or session may have changed): ${text.slice(0, 120)}`);
   }
 }
 
-// Qmatic differs across versions: {"dates":[...]} | [...] | items of strings or {date|publicId}
-function extractDates(payload: unknown): string[] {
-  const arr = Array.isArray(payload)
-    ? payload
-    : (payload as { dates?: unknown })?.dates;
-  if (!Array.isArray(arr)) return [];
-  return arr
-    .map((item) => {
-      if (typeof item === "string") return item;
-      if (item && typeof item === "object") {
-        const o = item as Record<string, unknown>;
-        const v = o.date ?? o.publicId ?? o.value;
-        return typeof v === "string" ? v : undefined;
-      }
-      return undefined;
-    })
-    .filter((v): v is string => Boolean(v));
-}
+/**
+ * Qmatic versions disagree on the response shape: `{ [listKey]: [...] }` or a bare array,
+ * whose items are either strings or objects carrying the value under one of `fields`.
+ */
+function extractStrings(payload: unknown, listKey: string, fields: string[]): string[] {
+  const list = Array.isArray(payload) ? payload : (payload as Record<string, unknown> | null)?.[listKey];
+  if (!Array.isArray(list)) return [];
 
-// Times come as {"times":[...]} | [...] of strings or {time|date}
-function extractTimes(payload: unknown): string[] {
-  const arr = Array.isArray(payload)
-    ? payload
-    : (payload as { times?: unknown })?.times;
-  if (!Array.isArray(arr)) return [];
-  return arr
-    .map((item) => {
-      if (typeof item === "string") return item;
-      if (item && typeof item === "object") {
-        const o = item as Record<string, unknown>;
-        const v = o.time ?? o.date ?? o.value;
-        return typeof v === "string" ? v : undefined;
-      }
-      return undefined;
-    })
-    .filter((v): v is string => Boolean(v));
+  return list.flatMap((item) => {
+    if (typeof item === "string") return [item];
+    if (item && typeof item === "object") {
+      const record = item as Record<string, unknown>;
+      const value = fields.map((f) => record[f]).find((v) => typeof v === "string");
+      return typeof value === "string" ? [value] : [];
+    }
+    return [];
+  });
 }
 
 export async function fetchAvailableDates(): Promise<string[]> {
-  return extractDates(await getJson(datesUrl()));
+  const payload = await getJson(scheduleUrl("dates"));
+  return extractStrings(payload, "dates", ["date", "publicId", "value"]);
 }
 
 export async function fetchTimes(date: string): Promise<string[]> {
-  return extractTimes(await getJson(timesUrl(date)));
+  const payload = await getJson(scheduleUrl(`dates/${date}/times`));
+  return extractStrings(payload, "times", ["time", "date", "value"]);
 }
 
-/** Fetch all available dates and their concrete times. */
-export async function fetchAvailability(): Promise<TimeSlot[]> {
+/** Fetch every available date together with its concrete time slots. */
+export async function fetchAvailability(): Promise<AvailableDay[]> {
   const dates = await fetchAvailableDates();
-  const slots: TimeSlot[] = [];
+  const days: AvailableDay[] = [];
   for (const date of dates) {
     try {
-      slots.push({ date, times: await fetchTimes(date) });
+      days.push({ date, times: await fetchTimes(date) });
     } catch {
-      slots.push({ date, times: [] }); // date is free even if the times call hiccups
+      days.push({ date, times: [] }); // the date is free even if the times request fails
     }
   }
-  return slots;
+  return days;
 }
