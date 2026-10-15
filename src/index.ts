@@ -1,35 +1,50 @@
 import { Bot } from "grammy";
 import { config } from "./config.js";
-import { fetchAvailability, type TimeSlot } from "./qmatic.js";
+import { BOOKING_URL, fetchAvailability, type AvailableDay } from "./qmatic.js";
 import {
-  getState,
   claimOwner,
+  forgetSeen,
+  getSeen,
+  getState,
   isOwner,
+  markSeen,
   setActive,
   setBranch,
   setService,
-  forgetSeen,
-  getSeen,
-  markSeen,
 } from "./state.js";
+
+const QMATIC_ID_RE = /^[0-9a-fA-F]{64}$/;
+const RESTART_DELAY_MS = 10_000;
+
+const COMMANDS = [
+  { command: "start", description: "Enable notifications (first use claims the bot)" },
+  { command: "stop", description: "Pause notifications" },
+  { command: "status", description: "Show notification status and target" },
+  { command: "check", description: "Check free slots right now" },
+  { command: "config", description: "Show full branch and service IDs" },
+  { command: "setbranch", description: "Change the branch ID: /setbranch <64-hex id>" },
+  { command: "setservice", description: "Change the service ID: /setservice <64-hex id>" },
+  { command: "reset", description: "Re-notify about all currently free dates (for testing)" },
+];
+
+const COMMAND_LIST = COMMANDS.map((c) => `/${c.command}`).join(" ");
 
 const bot = new Bot(config.botToken);
 
-// Never let a single failed API call crash the whole process.
+// Never let a single failed handler crash the whole process.
 bot.catch((err) => {
   const e = err.error;
   console.error("Bot error:", e instanceof Error ? e.message : e);
 });
 
-const BOOKING_URL = `${config.base}/#/`;
-const ID_RE = /^[0-9a-fA-F]{64}$/;
+const shortId = (id: string) => `…${id.slice(-8)}`;
 
-function formatSlots(slots: TimeSlot[]): string {
-  if (slots.length === 0) return "Brak wolnych terminów. 😴";
-  return slots
-    .map((s) => {
-      const times = s.times.length ? s.times.join(", ") : "(godziny — sprawdź na stronie)";
-      return `📅 *${s.date}*\n${times}`;
+function formatDays(days: AvailableDay[]): string {
+  if (days.length === 0) return "No free slots. 😴";
+  return days
+    .map((day) => {
+      const times = day.times.length ? day.times.join(", ") : "(times unavailable — check the website)";
+      return `📅 *${day.date}*\n${times}`;
     })
     .join("\n\n");
 }
@@ -44,163 +59,166 @@ async function notifyOwner(text: string): Promise<void> {
   }
 }
 
+// --- Polling ---
+
 async function poll(): Promise<void> {
-  let slots: TimeSlot[];
+  let days: AvailableDay[];
   try {
-    slots = await fetchAvailability();
+    days = await fetchAvailability();
   } catch (err) {
     console.error("Poll error:", (err as Error).message);
     return;
   }
 
-  const current = slots.map((s) => s.date);
-  const st = getState();
+  const current = days.map((d) => d.date);
+  const state = getState();
 
-  // First poll ever (or right after a branch/service change) — record silently, don't notify.
-  if (!st.initialized) {
+  // First poll ever, or right after a branch/service change: record silently, don't notify.
+  if (!state.initialized) {
     markSeen(current);
     console.log(`Baseline seeded: ${current.length} date(s).`);
     return;
   }
 
   const seen = getSeen();
-  const fresh = current.filter((d) => !seen.has(d));
+  const fresh = new Set(current.filter((d) => !seen.has(d)));
   markSeen(current);
 
-  if (fresh.length > 0 && st.active && st.ownerId !== null) {
-    const freshSlots = slots.filter((s) => fresh.includes(s.date));
-    console.log(`New dates: ${fresh.join(", ")}`);
-    await notifyOwner(
-      `🟢 *Pojawiły się wolne terminy!*\n\n${formatSlots(freshSlots)}\n\n👉 [Rezerwuj](${BOOKING_URL})`,
-    );
-  } else {
-    console.log(`Poll OK — ${current.length} date(s), nothing new.`);
+  if (fresh.size === 0 || !state.active || state.ownerId === null) {
+    console.log(`Poll OK: ${current.length} date(s), nothing new.`);
+    return;
+  }
+
+  console.log(`New dates: ${[...fresh].join(", ")}`);
+  const freshDays = days.filter((d) => fresh.has(d.date));
+  await notifyOwner(`🟢 *New free slots!*\n\n${formatDays(freshDays)}\n\n👉 [Book now](${BOOKING_URL})`);
+}
+
+// Schedule the next poll only after the previous one finishes, so slow responses never overlap.
+async function pollLoop(): Promise<void> {
+  try {
+    await poll();
+  } finally {
+    setTimeout(pollLoop, config.pollIntervalSec * 1000);
   }
 }
 
-// --- Owner gate: only the owner may interact. Before an owner is claimed, only /start passes. ---
+// --- Owner gate: only the owner may talk to the bot. Until someone claims it, only /start passes. ---
+
 bot.use(async (ctx, next) => {
   const chatId = ctx.chat?.id;
   if (chatId === undefined) return;
   const { ownerId } = getState();
 
   if (ownerId === null) {
-    const text = ctx.message?.text ?? "";
-    if (text.startsWith("/start")) return next(); // allow claiming
-    return; // ignore everyone until claimed
+    if (ctx.message?.text?.startsWith("/start")) return next();
+    return;
   }
-
-  if (chatId !== ownerId) return; // not the owner -> silently ignore
+  if (chatId !== ownerId) return; // silently ignore strangers
   return next();
 });
 
 // --- Commands ---
 
 bot.command("start", async (ctx) => {
-  const claimed = claimOwner(ctx.chat.id);
-  if (claimed) {
-    await ctx.reply(
-      "✅ Jesteś teraz właścicielem tego bota. Powiadomię Cię o wolnych terminach.\n\n" +
-        "Komendy: /status /check /config /setbranch /setservice /reset /stop",
-    );
+  if (claimOwner(ctx.chat.id)) {
+    await ctx.reply(`✅ You now own this bot. I'll message you when free slots appear.\n\nCommands: ${COMMAND_LIST}`);
   } else if (isOwner(ctx.chat.id)) {
     setActive(true);
-    await ctx.reply("✅ Powiadomienia włączone.\n\nKomendy: /status /check /config /setbranch /setservice /reset /stop");
+    await ctx.reply(`✅ Notifications enabled.\n\nCommands: ${COMMAND_LIST}`);
   }
 });
 
 bot.command("stop", async (ctx) => {
   setActive(false);
-  await ctx.reply("🛑 Powiadomienia wstrzymane. /start aby wznowić.");
+  await ctx.reply("🛑 Notifications paused. Send /start to resume.");
 });
 
 bot.command("status", async (ctx) => {
-  const st = getState();
+  const state = getState();
   await ctx.reply(
-    `Powiadomienia: ${st.active ? "włączone ✅" : "wstrzymane 🛑"}\n` +
-      `Interwał: ${config.pollIntervalSec}s\n` +
-      `Branch: …${st.branchId.slice(-8)}\n` +
-      `Service: …${st.serviceId.slice(-8)}`,
+    `Notifications: ${state.active ? "enabled ✅" : "paused 🛑"}\n` +
+      `Poll interval: ${config.pollIntervalSec}s\n` +
+      `Branch: ${shortId(state.branchId)}\n` +
+      `Service: ${shortId(state.serviceId)}`,
   );
 });
 
 bot.command("config", async (ctx) => {
-  const st = getState();
+  const state = getState();
   await ctx.reply(
-    `*Aktualna konfiguracja:*\n\n` +
-      `Branch ID:\n\`${st.branchId}\`\n\n` +
-      `Service ID:\n\`${st.serviceId}\`\n\n` +
-      `Zmień: /setbranch lub /setservice`,
+    `*Current target:*\n\n` +
+      `Branch ID:\n\`${state.branchId}\`\n\n` +
+      `Service ID:\n\`${state.serviceId}\`\n\n` +
+      `Change with /setbranch or /setservice`,
     { parse_mode: "Markdown" },
   );
 });
 
 bot.command("setbranch", async (ctx) => {
   const id = ctx.match.trim();
-  if (!ID_RE.test(id)) {
-    await ctx.reply("❌ Podaj 64-znakowy ID (hex).\nPrzykład: /setbranch 1cf1e3e6…");
+  if (!QMATIC_ID_RE.test(id)) {
+    await ctx.reply("❌ Expected a 64-character hex ID.\nExample: /setbranch 1cf1e3e6…");
     return;
   }
-  setBranch(id); // resets baseline internally
-  await ctx.reply(`✅ Branch ID ustawiony na:\n\`${id}\``, { parse_mode: "Markdown" });
+  setBranch(id);
+  await ctx.reply(`✅ Branch ID set to:\n\`${id}\``, { parse_mode: "Markdown" });
 });
 
 bot.command("setservice", async (ctx) => {
   const id = ctx.match.trim();
-  if (!ID_RE.test(id)) {
-    await ctx.reply("❌ Podaj 64-znakowy ID (hex).\nPrzykład: /setservice 2c5251d5…");
+  if (!QMATIC_ID_RE.test(id)) {
+    await ctx.reply("❌ Expected a 64-character hex ID.\nExample: /setservice 2c5251d5…");
     return;
   }
-  setService(id); // resets baseline internally
-  await ctx.reply(`✅ Service ID ustawiony na:\n\`${id}\``, { parse_mode: "Markdown" });
+  setService(id);
+  await ctx.reply(`✅ Service ID set to:\n\`${id}\``, { parse_mode: "Markdown" });
 });
 
 bot.command("reset", async (ctx) => {
   forgetSeen();
   await ctx.reply(
-    "♻️ Pamięć wyczyszczona. Przy najbliższym sprawdzeniu (do 60s) dostaniesz " +
-      "powiadomienie o wszystkich aktualnie dostępnych terminach — dobre do testu.\n\n" +
-      "Ustawienia (branch/service) bez zmian.",
+    `♻️ Memory cleared. Within ${config.pollIntervalSec}s you'll get a notification about ` +
+      "every date that is currently free. Useful for testing.\n\nBranch and service are unchanged.",
   );
 });
 
 bot.command("check", async (ctx) => {
-  await ctx.reply("Sprawdzam… ⏳");
+  await ctx.reply("Checking… ⏳");
   try {
-    const slots = await fetchAvailability();
-    await ctx.reply(`${formatSlots(slots)}\n\n👉 [Rezerwuj](${BOOKING_URL})`, {
-      parse_mode: "Markdown",
-    });
+    const days = await fetchAvailability();
+    await ctx.reply(`${formatDays(days)}\n\n👉 [Book now](${BOOKING_URL})`, { parse_mode: "Markdown" });
   } catch (err) {
-    await ctx.reply(`Błąd przy sprawdzaniu: ${(err as Error).message}`);
+    await ctx.reply(`Check failed: ${(err as Error).message}`);
   }
 });
 
 // --- Boot ---
 
-async function main(): Promise<void> {
-  const st = getState();
-  console.log(
-    `Polling every ${config.pollIntervalSec}s. Owner=${st.ownerId ?? "(unclaimed)"} ` +
-      `Branch=…${st.branchId.slice(-8)} Service=…${st.serviceId.slice(-8)}`,
-  );
-
-  setInterval(poll, Math.max(30, config.pollIntervalSec) * 1000);
-  void poll(); // seed baseline immediately instead of waiting one interval
-
-  startBotWithRetry();
+// getUpdates fails with 409 while another instance is still polling (e.g. during a redeploy).
+// bot.catch doesn't cover the polling loop itself, so restart it instead of crashing.
+function startBot(): void {
+  bot.start({ onStart: () => console.log("Bot started.") }).catch((err) => {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`Polling stopped (${message}). Retrying in ${RESTART_DELAY_MS / 1000}s…`);
+    setTimeout(startBot, RESTART_DELAY_MS);
+  });
 }
 
-// getUpdates can fail with 409 during a redeploy overlap (two instances briefly).
-// bot.catch doesn't cover the polling loop, so retry instead of crashing.
-function startBotWithRetry(): void {
-  bot
-    .start({ onStart: () => console.log("Bot started.") })
-    .catch((err) => {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`Polling stopped (${msg}). Retrying in 10s…`);
-      setTimeout(startBotWithRetry, 10_000);
-    });
+// Stop long polling cleanly so the next instance doesn't hit a 409.
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.once(signal, async () => {
+    await bot.stop();
+    process.exit(0);
+  });
 }
 
-main();
+const state = getState();
+console.log(
+  `Polling every ${config.pollIntervalSec}s. Owner=${state.ownerId ?? "(unclaimed)"} ` +
+    `Branch=${shortId(state.branchId)} Service=${shortId(state.serviceId)}`,
+);
+
+bot.api.setMyCommands(COMMANDS).catch((err) => console.error("Failed to register commands:", err.message));
+void pollLoop(); // seed the baseline right away instead of waiting one interval
+startBot();

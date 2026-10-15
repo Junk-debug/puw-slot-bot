@@ -16,8 +16,8 @@ RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
 COPY certs ./certs
 
-# PUW server ships an incomplete TLS chain — supply the missing Certum
-# intermediate so Node can verify it (verification stays ON).
+# The PUW server sends an incomplete TLS chain, so supply the missing Certum
+# intermediate for Node to verify it (TLS verification stays on).
 ENV NODE_EXTRA_CA_CERTS=/app/certs/certum-dv-tls-g2-r39.pem
 
 CMD ["node", "dist/index.js"]
